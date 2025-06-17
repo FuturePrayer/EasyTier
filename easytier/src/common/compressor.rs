@@ -1,5 +1,7 @@
-use async_compression::tokio::write::{ZstdDecoder, ZstdEncoder};
-use tokio::io::AsyncWriteExt;
+use anyhow::Context;
+use dashmap::DashMap;
+use std::cell::RefCell;
+use zstd::bulk;
 
 use zerocopy::{AsBytes as _, FromBytes as _};
 
@@ -29,17 +31,19 @@ impl DefaultCompressor {
         data: &[u8],
         compress_algo: CompressorAlgo,
     ) -> Result<Vec<u8>, Error> {
-        let buf = match compress_algo {
-            CompressorAlgo::ZstdDefault => {
-                let mut o = ZstdEncoder::new(Vec::new());
-                o.write_all(data).await?;
-                o.shutdown().await?;
-                o.into_inner()
-            }
-            CompressorAlgo::None => data.to_vec(),
-        };
-
-        Ok(buf)
+        match compress_algo {
+            CompressorAlgo::ZstdDefault => CTX_MAP.with(|map_cell| {
+                let map = map_cell.borrow();
+                let mut ctx_entry = map.entry(compress_algo).or_default();
+                ctx_entry.compress(data).with_context(|| {
+                    format!(
+                        "Failed to compress data with algorithm: {:?}",
+                        compress_algo
+                    )
+                })
+            }),
+            CompressorAlgo::None => Ok(data.to_vec()),
+        }
     }
 
     pub async fn decompress_raw(
@@ -47,17 +51,30 @@ impl DefaultCompressor {
         data: &[u8],
         compress_algo: CompressorAlgo,
     ) -> Result<Vec<u8>, Error> {
-        let buf = match compress_algo {
-            CompressorAlgo::ZstdDefault => {
-                let mut o = ZstdDecoder::new(Vec::new());
-                o.write_all(data).await?;
-                o.shutdown().await?;
-                o.into_inner()
-            }
-            CompressorAlgo::None => data.to_vec(),
-        };
-
-        Ok(buf)
+        match compress_algo {
+            CompressorAlgo::ZstdDefault => DCTX_MAP.with(|map_cell| {
+                let map = map_cell.borrow();
+                let mut ctx_entry = map.entry(compress_algo).or_default();
+                for i in 1..=5 {
+                    let mut len = data.len() * 2usize.pow(i);
+                    if i == 5 && len < 64 * 1024 {
+                        len = 64 * 1024; // Ensure a minimum buffer size
+                    }
+                    match ctx_entry.decompress(data, len) {
+                        Ok(buf) => return Ok(buf),
+                        Err(e) if e.to_string().contains("buffer is too small") => {
+                            continue; // Try with a larger buffer
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Err(anyhow::anyhow!(
+                    "Failed to decompress data after multiple attempts with algorithm: {:?}",
+                    compress_algo
+                ))
+            }),
+            CompressorAlgo::None => Ok(data.to_vec()),
+        }
     }
 }
 
@@ -146,6 +163,11 @@ impl Compressor for DefaultCompressor {
     }
 }
 
+thread_local! {
+    static CTX_MAP: RefCell<DashMap<CompressorAlgo, bulk::Compressor<'static>>> = RefCell::new(DashMap::new());
+    static DCTX_MAP: RefCell<DashMap<CompressorAlgo, bulk::Decompressor<'static>>> = RefCell::new(DashMap::new());
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -158,10 +180,21 @@ pub mod tests {
 
         let compressor = DefaultCompressor {};
 
+        println!(
+            "Uncompressed packet: {:?}, len: {}",
+            packet,
+            packet.payload_len()
+        );
+
         compressor
             .compress(&mut packet, CompressorAlgo::ZstdDefault)
             .await
             .unwrap();
+        println!(
+            "Compressed packet: {:?}, len: {}",
+            packet,
+            packet.payload_len()
+        );
         assert_eq!(packet.peer_manager_header().unwrap().is_compressed(), true);
 
         compressor.decompress(&mut packet).await.unwrap();
