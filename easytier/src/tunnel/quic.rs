@@ -2,14 +2,20 @@
 //!
 //! Checkout the `README.md` for guidance.
 
-use std::{error::Error, net::SocketAddr, sync::Arc};
+use std::{
+    error::Error, io::IoSliceMut, net::SocketAddr, pin::Pin, sync::Arc, task::Poll, time::Duration,
+};
 
 use crate::tunnel::{
     common::{FramedReader, FramedWriter, TunnelWrapper},
     TunnelInfo,
 };
 use anyhow::Context;
-use quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Connection, Endpoint, ServerConfig};
+
+use quinn::{
+    congestion::BbrConfig, crypto::rustls::QuicClientConfig, udp::RecvMeta, AsyncUdpSocket,
+    ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TransportConfig, UdpPoller,
+};
 
 use super::{
     check_scheme_and_get_socket_addr,
@@ -18,9 +24,59 @@ use super::{
 };
 
 pub fn configure_client() -> ClientConfig {
-    ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(get_insecure_tls_client_config()).unwrap(),
-    ))
+    let client_crypto = QuicClientConfig::try_from(get_insecure_tls_client_config()).unwrap();
+    let mut client_config = ClientConfig::new(Arc::new(client_crypto));
+
+    // // Create a new TransportConfig and set BBR
+    let mut transport_config = TransportConfig::default();
+    transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+    // Replace the default TransportConfig with the transport_config() method
+    client_config.transport_config(Arc::new(transport_config));
+
+    client_config
+}
+
+#[derive(Clone, Debug)]
+struct NoGroAsyncUdpSocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+}
+
+impl AsyncUdpSocket for NoGroAsyncUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        self.inner.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
+        self.inner.try_send(transmit)
+    }
+
+    /// Receive UDP datagrams, or register to be woken if receiving may succeed in the future
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<std::io::Result<usize>> {
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    /// Look up the local IP address and port used by this socket
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
 }
 
 /// Constructs a QUIC endpoint configured to listen for incoming connections on a certain address
@@ -33,7 +89,20 @@ pub fn configure_client() -> ClientConfig {
 #[allow(unused)]
 pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, Vec<u8>), Box<dyn Error>> {
     let (server_config, server_cert) = configure_server()?;
-    let endpoint = Endpoint::server(server_config, bind_addr)?;
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no async runtime found"))?;
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.max_udp_payload_size(1200)?;
+    let socket = NoGroAsyncUdpSocket {
+        inner: runtime.wrap_udp_socket(socket)?,
+    };
+    let endpoint = Endpoint::new_with_abstract_socket(
+        endpoint_config,
+        Some(server_config),
+        Arc::new(socket),
+        runtime,
+    )?;
     Ok((endpoint, server_cert))
 }
 
@@ -45,6 +114,8 @@ pub fn configure_server() -> Result<(ServerConfig, Vec<u8>), Box<dyn Error>> {
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(10_u8.into());
     transport_config.max_concurrent_bidi_streams(10_u8.into());
+    // Setting BBR congestion control
+    transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
 
     Ok((server_config, certs[0].to_vec()))
 }

@@ -12,8 +12,9 @@ use std::{
 
 use anyhow::Context;
 use cidr::IpCidr;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
+use clap_complete::Shell;
 use easytier::{
     common::{
         config::{
@@ -22,6 +23,7 @@ use easytier::{
         },
         constants::EASYTIER_VERSION,
         global_ctx::GlobalCtx,
+        set_default_machine_id,
         stun::MockStunInfoCollector,
     },
     connector::create_connector_by_url,
@@ -43,7 +45,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL_MIMALLOC: MiMalloc = MiMalloc;
 
-#[cfg(feature = "jemalloc")]
+#[cfg(feature = "jemalloc-prof")]
 use jemalloc_ctl::{epoch, stats, Access as _, AsName as _};
 
 #[cfg(feature = "jemalloc")]
@@ -51,7 +53,7 @@ use jemalloc_ctl::{epoch, stats, Access as _, AsName as _};
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn set_prof_active(_active: bool) {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(feature = "jemalloc-prof")]
     {
         const PROF_ACTIVE: &'static [u8] = b"prof.active\0";
         let name = PROF_ACTIVE.name();
@@ -60,7 +62,7 @@ fn set_prof_active(_active: bool) {
 }
 
 fn dump_profile(_cur_allocated: usize) {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(feature = "jemalloc-prof")]
     {
         const PROF_DUMP: &'static [u8] = b"prof.dump\0";
         static mut PROF_DUMP_FILE_NAME: [u8; 128] = [0; 128];
@@ -100,6 +102,13 @@ struct Cli {
     config_server: Option<String>,
 
     #[arg(
+        long,
+        env = "ET_MACHINE_ID",
+        help = t!("core_clap.machine_id").to_string()
+    )]
+    machine_id: Option<String>,
+
+    #[arg(
         short,
         long,
         env = "ET_CONFIG_FILE",
@@ -114,6 +123,9 @@ struct Cli {
 
     #[command(flatten)]
     logging_options: LoggingOptions,
+
+    #[clap(long, help = t!("core_clap.generate_completions").to_string())]
+    gen_autocomplete: Option<Shell>,
 }
 
 #[derive(Parser, Debug)]
@@ -139,6 +151,13 @@ struct NetworkOptions {
         help = t!("core_clap.ipv4").to_string()
     )]
     ipv4: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6",
+        help = t!("core_clap.ipv6").to_string()
+    )]
+    ipv6: Option<String>,
 
     #[arg(
         short,
@@ -267,6 +286,13 @@ struct NetworkOptions {
         default_missing_value = "true"
     )]
     multi_thread: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_MULTI_THREAD_COUNT",
+        help = t!("core_clap.multi_thread_count").to_string(),
+    )]
+    multi_thread_count: Option<u32>,
 
     #[arg(
         long,
@@ -473,6 +499,29 @@ struct NetworkOptions {
         help = t!("core_clap.private_mode").to_string(),
     )]
     private_mode: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_FOREIGN_RELAY_BPS_LIMIT",
+        help = t!("core_clap.foreign_relay_bps_limit").to_string(),
+    )]
+    foreign_relay_bps_limit: Option<u64>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "TCP port whitelist. Supports single ports (80) and ranges (8000-9000)",
+        num_args = 0..
+    )]
+    tcp_whitelist: Vec<String>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "UDP port whitelist. Supports single ports (53) and ranges (5000-6000)",
+        num_args = 0..
+    )]
+    udp_whitelist: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -593,6 +642,12 @@ impl NetworkOptions {
             })?))
         }
 
+        if let Some(ipv6) = &self.ipv6 {
+            cfg.set_ipv6(Some(ipv6.parse().with_context(|| {
+                format!("failed to parse ipv6 address: {}", ipv6)
+            })?))
+        }
+
         if !self.peers.is_empty() {
             let mut peers = cfg.get_peers();
             peers.reserve(peers.len() + self.peers.len());
@@ -623,6 +678,7 @@ impl NetworkOptions {
         }
 
         if !self.mapped_listeners.is_empty() {
+            let mut errs = Vec::new();
             cfg.set_mapped_listeners(Some(
                 self.mapped_listeners
                     .iter()
@@ -633,12 +689,21 @@ impl NetworkOptions {
                     })
                     .map(|s: url::Url| {
                         if s.port().is_none() {
-                            panic!("mapped listener port is missing: {}", s);
+                            errs.push(anyhow::anyhow!("mapped listener port is missing: {}", s));
                         }
                         s
                     })
-                    .collect(),
+                    .collect::<Vec<_>>(),
             ));
+            if !errs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "{}",
+                    errs.iter()
+                        .map(|x| format!("{}", x))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
         }
 
         for n in self.proxy_networks.iter() {
@@ -655,7 +720,13 @@ impl NetworkOptions {
         };
         cfg.set_rpc_portal(rpc_portal);
 
-        cfg.set_rpc_portal_whitelist(self.rpc_portal_whitelist.clone());
+        if let Some(rpc_portal_whitelist) = &self.rpc_portal_whitelist {
+            let mut whitelist = cfg.get_rpc_portal_whitelist().unwrap_or_else(|| Vec::new());
+            for cidr in rpc_portal_whitelist {
+                whitelist.push((*cidr).clone());
+            }
+            cfg.set_rpc_portal_whitelist(Some(whitelist));
+        }
 
         if let Some(external_nodes) = self.external_node.as_ref() {
             let mut old_peers = cfg.get_peers();
@@ -795,11 +866,23 @@ impl NetworkOptions {
         f.disable_quic_input = self.disable_quic_input.unwrap_or(f.disable_quic_input);
         f.accept_dns = self.accept_dns.unwrap_or(f.accept_dns);
         f.private_mode = self.private_mode.unwrap_or(f.private_mode);
+        f.foreign_relay_bps_limit = self
+            .foreign_relay_bps_limit
+            .unwrap_or(f.foreign_relay_bps_limit);
+        f.multi_thread_count = self.multi_thread_count.unwrap_or(f.multi_thread_count);
         cfg.set_flags(f);
 
         if !self.exit_nodes.is_empty() {
             cfg.set_exit_nodes(self.exit_nodes.clone());
         }
+
+        let mut old_tcp_whitelist = cfg.get_tcp_whitelist();
+        old_tcp_whitelist.extend(self.tcp_whitelist.clone());
+        cfg.set_tcp_whitelist(old_tcp_whitelist);
+
+        let mut old_udp_whitelist = cfg.get_udp_whitelist();
+        old_udp_whitelist.extend(self.udp_whitelist.clone());
+        cfg.set_udp_whitelist(old_udp_whitelist);
 
         Ok(())
     }
@@ -936,6 +1019,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     init_logger(&cli.logging_options, false)?;
 
     if cli.config_server.is_some() {
+        set_default_machine_id(cli.machine_id);
         let config_server_url_s = cli.config_server.clone().unwrap();
         let config_server_url = match url::Url::parse(&config_server_url_s) {
             Ok(u) => u,
@@ -1027,6 +1111,14 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
 
     tokio::select! {
         _ = manager.wait() => {
+            let infos = manager.collect_network_infos()?;
+            let errs = infos
+                .into_values()
+                .filter_map(|info| info.error_msg)
+                .collect::<Vec<_>>();
+            if errs.len() > 0 {
+                return Err(anyhow::anyhow!("some instances stopped with errors"));
+            }
         }
         _ = tokio::signal::ctrl_c() => {
             println!("ctrl-c received, exiting...");
@@ -1036,7 +1128,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn memory_monitor() {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(feature = "jemalloc-prof")]
     {
         let mut last_peak_size = 0;
         let e = epoch::mib().unwrap();
@@ -1101,6 +1193,11 @@ async fn main() -> ExitCode {
     let _monitor = std::thread::spawn(memory_monitor);
 
     let cli = Cli::parse();
+    if let Some(shell) = cli.gen_autocomplete {
+        let mut cmd = Cli::command();
+        easytier::print_completions(shell, &mut cmd, "easytier-core");
+        return ExitCode::SUCCESS;
+    }
     let mut ret_code = 0;
 
     if let Err(e) = run_main(cli).await {

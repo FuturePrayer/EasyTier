@@ -2,6 +2,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
+    u64,
 };
 
 use anyhow::Context;
@@ -9,7 +10,10 @@ use cidr::IpCidr;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    proto::common::{CompressionAlgoPb, PortForwardConfigPb, SocketType},
+    proto::{
+        acl::Acl,
+        common::{CompressionAlgoPb, PortForwardConfigPb, SocketType},
+    },
     tunnel::generate_digest_from_str,
 };
 
@@ -41,6 +45,8 @@ pub fn gen_default_flags() -> Flags {
         private_mode: false,
         enable_quic_proxy: false,
         disable_quic_input: false,
+        foreign_relay_bps_limit: u64::MAX,
+        multi_thread_count: 2,
     }
 }
 
@@ -61,10 +67,17 @@ pub trait ConfigLoader: Send + Sync {
     fn get_ipv4(&self) -> Option<cidr::Ipv4Inet>;
     fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>);
 
+    fn get_ipv6(&self) -> Option<cidr::Ipv6Inet>;
+    fn set_ipv6(&self, addr: Option<cidr::Ipv6Inet>);
+
     fn get_dhcp(&self) -> bool;
     fn set_dhcp(&self, dhcp: bool);
 
-    fn add_proxy_cidr(&self, cidr: cidr::Ipv4Cidr, mapped_cidr: Option<cidr::Ipv4Cidr>);
+    fn add_proxy_cidr(
+        &self,
+        cidr: cidr::Ipv4Cidr,
+        mapped_cidr: Option<cidr::Ipv4Cidr>,
+    ) -> Result<(), anyhow::Error>;
     fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr);
     fn get_proxy_cidrs(&self) -> Vec<ProxyNetworkConfig>;
 
@@ -105,6 +118,15 @@ pub trait ConfigLoader: Send + Sync {
 
     fn get_port_forwards(&self) -> Vec<PortForwardConfig>;
     fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>);
+
+    fn get_acl(&self) -> Option<Acl>;
+    fn set_acl(&self, acl: Option<Acl>);
+
+    fn get_tcp_whitelist(&self) -> Vec<String>;
+    fn set_tcp_whitelist(&self, whitelist: Vec<String>);
+
+    fn get_udp_whitelist(&self) -> Vec<String>;
+    fn set_udp_whitelist(&self, whitelist: Vec<String>);
 
     fn dump(&self) -> String;
 }
@@ -214,7 +236,7 @@ pub struct VpnPortalConfig {
     pub wireguard_listen: SocketAddr,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct PortForwardConfig {
     pub bind_addr: SocketAddr,
     pub dst_addr: SocketAddr,
@@ -256,6 +278,7 @@ struct Config {
     instance_name: Option<String>,
     instance_id: Option<uuid::Uuid>,
     ipv4: Option<String>,
+    ipv6: Option<String>,
     dhcp: Option<bool>,
     network_identity: Option<NetworkIdentity>,
     listeners: Option<Vec<url::Url>>,
@@ -280,6 +303,11 @@ struct Config {
 
     #[serde(skip)]
     flags_struct: Option<Flags>,
+
+    acl: Option<Acl>,
+
+    tcp_whitelist: Option<Vec<String>>,
+    udp_whitelist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +441,23 @@ impl ConfigLoader for TomlConfigLoader {
         };
     }
 
+    fn get_ipv6(&self) -> Option<cidr::Ipv6Inet> {
+        let locked_config = self.config.lock().unwrap();
+        locked_config
+            .ipv6
+            .as_ref()
+            .map(|s| s.parse().ok())
+            .flatten()
+    }
+
+    fn set_ipv6(&self, addr: Option<cidr::Ipv6Inet>) {
+        self.config.lock().unwrap().ipv6 = if let Some(addr) = addr {
+            Some(addr.to_string())
+        } else {
+            None
+        };
+    }
+
     fn get_dhcp(&self) -> bool {
         self.config.lock().unwrap().dhcp.unwrap_or_default()
     }
@@ -421,17 +466,23 @@ impl ConfigLoader for TomlConfigLoader {
         self.config.lock().unwrap().dhcp = Some(dhcp);
     }
 
-    fn add_proxy_cidr(&self, cidr: cidr::Ipv4Cidr, mapped_cidr: Option<cidr::Ipv4Cidr>) {
+    fn add_proxy_cidr(
+        &self,
+        cidr: cidr::Ipv4Cidr,
+        mapped_cidr: Option<cidr::Ipv4Cidr>,
+    ) -> Result<(), anyhow::Error> {
         let mut locked_config = self.config.lock().unwrap();
         if locked_config.proxy_network.is_none() {
             locked_config.proxy_network = Some(vec![]);
         }
         if let Some(mapped_cidr) = mapped_cidr.as_ref() {
-            assert_eq!(
-                cidr.network_length(),
-                mapped_cidr.network_length(),
-                "Mapped CIDR must have the same network length as the original CIDR",
-            );
+            if cidr.network_length() != mapped_cidr.network_length() {
+                return Err(anyhow::anyhow!(
+                    "Mapped CIDR must have the same network length as the original CIDR: {} != {}",
+                    cidr.network_length(),
+                    mapped_cidr.network_length()
+                ));
+            }
         }
         // insert if no duplicate
         if !locked_config
@@ -451,6 +502,7 @@ impl ConfigLoader for TomlConfigLoader {
                     allow: None,
                 });
         }
+        Ok(())
     }
 
     fn remove_proxy_cidr(&self, cidr: cidr::Ipv4Cidr) {
@@ -612,6 +664,40 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_port_forwards(&self, forwards: Vec<PortForwardConfig>) {
         self.config.lock().unwrap().port_forward = Some(forwards);
+    }
+
+    fn get_acl(&self) -> Option<Acl> {
+        self.config.lock().unwrap().acl.clone()
+    }
+
+    fn set_acl(&self, acl: Option<Acl>) {
+        self.config.lock().unwrap().acl = acl;
+    }
+
+    fn get_tcp_whitelist(&self) -> Vec<String> {
+        self.config
+            .lock()
+            .unwrap()
+            .tcp_whitelist
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn set_tcp_whitelist(&self, whitelist: Vec<String>) {
+        self.config.lock().unwrap().tcp_whitelist = Some(whitelist);
+    }
+
+    fn get_udp_whitelist(&self) -> Vec<String> {
+        self.config
+            .lock()
+            .unwrap()
+            .udp_whitelist
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn set_udp_whitelist(&self, whitelist: Vec<String>) {
+        self.config.lock().unwrap().udp_whitelist = Some(whitelist);
     }
 
     fn dump(&self) -> String {
