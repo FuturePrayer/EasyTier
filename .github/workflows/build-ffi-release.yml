@@ -1,0 +1,179 @@
+name: Build easytier-ffi on upstream release
+
+on:
+  schedule:
+    - cron: '15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: EasyTier/EasyTier
+
+jobs:
+  check-upstream-release:
+    runs-on: ubuntu-latest
+    outputs:
+      has_new_release: ${{ steps.check.outputs.has_new_release }}
+      tag_name: ${{ steps.check.outputs.tag_name }}
+
+    steps:
+      - name: Get latest upstream release
+        id: upstream
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const [owner, repo] = process.env.UPSTREAM_REPO.split('/');
+            const release = await github.rest.repos.getLatestRelease({
+              owner,
+              repo
+            });
+            core.setOutput('tag_name', release.data.tag_name);
+
+      - name: Check whether release already exists in fork
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = '${{ steps.upstream.outputs.tag_name }}';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag
+              });
+              core.setOutput('has_new_release', 'false');
+              core.setOutput('tag_name', tag);
+            } catch (e) {
+              if (e.status === 404) {
+                core.setOutput('has_new_release', 'true');
+                core.setOutput('tag_name', tag);
+              } else {
+                throw e;
+              }
+            }
+
+  build:
+    needs: check-upstream-release
+    if: needs.check-upstream-release.outputs.has_new_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: easytier-ffi-windows-x86_64
+            lib_name: easytier_ffi.dll
+
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: easytier-ffi-windows-arm64
+            lib_name: easytier_ffi.dll
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: easytier-ffi-linux-x86_64
+            lib_name: libeasytier_ffi.so
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: easytier-ffi-linux-arm64
+            lib_name: libeasytier_ffi.so
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact_name: easytier-ffi-macos-x86_64
+            lib_name: libeasytier_ffi.dylib
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: easytier-ffi-macos-arm64
+            lib_name: libeasytier_ffi.dylib
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout upstream tag source
+        uses: actions/checkout@v4
+        with:
+          repository: EasyTier/EasyTier
+          ref: ${{ needs.check-upstream-release.outputs.tag_name }}
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux ARM64 cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure linker for aarch64-unknown-linux-gnu
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build easytier-ffi
+        run: cargo build --package easytier-ffi --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.lib_name }} dist/${{ matrix.lib_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.lib_name }}
+
+  publish-release:
+    needs: [check-upstream-release, build]
+    if: needs.check-upstream-release.outputs.has_new_release == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package artifacts
+        run: |
+          mkdir -p release-assets
+          cp artifacts/easytier-ffi-windows-x86_64/easytier_ffi.dll release-assets/easytier_ffi-windows-x86_64.dll
+          cp artifacts/easytier-ffi-windows-arm64/easytier_ffi.dll release-assets/easytier_ffi-windows-arm64.dll
+          cp artifacts/easytier-ffi-linux-x86_64/libeasytier_ffi.so release-assets/libeasytier_ffi-linux-x86_64.so
+          cp artifacts/easytier-ffi-linux-arm64/libeasytier_ffi.so release-assets/libeasytier_ffi-linux-arm64.so
+          cp artifacts/easytier-ffi-macos-x86_64/libeasytier_ffi.dylib release-assets/libeasytier_ffi-macos-x86_64.dylib
+          cp artifacts/easytier-ffi-macos-arm64/libeasytier_ffi.dylib release-assets/libeasytier_ffi-macos-arm64.dylib
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-upstream-release.outputs.tag_name }}
+          name: easytier-ffi ${{ needs.check-upstream-release.outputs.tag_name }}
+          body: |
+            Built from upstream release `${{ needs.check-upstream-release.outputs.tag_name }}` of `EasyTier/EasyTier`.
+
+            Included binaries:
+            - Windows x86_64
+            - Windows arm64
+            - Linux x86_64
+            - Linux arm64
+            - macOS x86_64
+            - macOS arm64
+          files: release-assets/*
